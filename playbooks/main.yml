@@ -1,0 +1,104 @@
+---
+- name: Container Security & Deployment Pipeline
+  hosts: localhost
+  connection: local
+  become: yes
+  collections:
+    - community.docker
+    - community.postgresql
+    - community.kubernetes
+
+  vars:
+    project: "project"
+    project_root: "/home/admin/{{ project }}"
+    repo_name: "my-repo"
+    repo_dir: "{{ project_root }}/{{ repo_name }}"
+    harbor_url: "harbor.app.kubeflow.masternode:30090"
+    gitea_url: "gitea.app.kubeflow.masternode:30080"
+    token: ""
+    backend_base_url: "http://dashboard.app.kubeflow.masternode:30008/"
+    backend_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTc1ODEzMjU5MH0.JxB2lAWv0WLcmJkIx_Nc4BacFq3VCLkWBr3vnOMdMiw"
+    expected_network: "{{ repo_name }}_app_net"
+    backup_dir: "{{ project_root }}/backup/{{ repo_name }}"
+    timestamp: "{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+    log_file: "/var/log/dockerflow/history.csv"
+    service_summaries: {}
+    docker_env:
+      DOCKER_HOST: tcp://192.168.49.2:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: "/home/admin/.minikube/certs"
+
+  tasks:
+    - name: Ensure directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ repo_dir }}"
+        - "{{ backup_dir }}"
+        - "/var/log/dockerflow"
+
+    - name: Clone repository
+      git:
+        repo: "http://gitea_admin:{{ token }}@{{ gitea_url }}/{{ project }}/{{ repo_name }}.git"
+        dest: "{{ repo_dir }}"
+        version: main
+        force: yes
+        update: yes
+
+
+    - name: Discover all k8s‑service dirs
+      set_fact:
+        built_services: >-
+          {{
+            lookup('fileglob', repo_dir + '/k8s/*', wantlist=True)
+            | map('basename')
+            | list
+          }}
+
+
+    - name: Process each service
+      include_tasks: process_service.yml
+      vars:
+        service: "{{ repo_name }}"
+        deploy_id: "{{ deploy_id }}"
+
+    - name: Display final deployment summary
+      debug:
+        msg: |
+          {% for name, summary in service_summaries.items() %}
+          === Service: {{ name }} ===
+          Build:   {{ summary.build_status | upper }}
+          Deploy:  {{ summary.status | upper }}
+          Checks:  {{ summary.security_checks | to_json }}
+          Vulns:   critical={{ summary.critical_vulns }}, high={{ summary.high_vulns }}
+          {% endfor %}
+
+    - name: Prepare list of summaries
+      set_fact:
+        summaries_list: "{{ service_summaries | dict2items }}"
+
+    - name: DEBUG - Show summaries_list
+      debug:
+        var: summaries_list
+
+    - name: Zapisz summaries do JSON dla workera
+      copy:
+        content: "{{ service_summaries | to_nice_json }}"
+        dest: "/var/log/dockerflow/summaries_{{ deploy_id }}.json"
+
+    - name: Delete Kubernetes Deployment
+      community.kubernetes.k8s:
+        kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
+        state: absent
+        kind: Deployment
+        name: "{{ repo_name }}"
+        namespace: default   # zmień na właściwy namespace
+      when: build_status == 'built'
+      ignore_errors: true
+
+    - name: Write pipeline log
+      copy:
+        content: "{{ service_summaries | to_nice_json }}"
+        dest: "/var/log/dockerflow/{{ project }}_{{ repo_name }}_{{ timestamp }}.log"
+[admin@flowmaster test]$
