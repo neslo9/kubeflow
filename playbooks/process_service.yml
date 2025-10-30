@@ -207,4 +207,3 @@
     mkdir -p /var/log/dockerflow
     echo "$(date +'%Y-%m-%d %H:%M:%S'),{{ repo_name }},{{ service_status }},{{ image_id_result.stdout }}" \
       >> /var/log/dockerflow/history.csv
-[admin@flowmaster test]$
