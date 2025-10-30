@@ -1,0 +1,210 @@
+---
+- name: Initialize variables for {{ repo_name }}
+  set_fact:
+    service_image:  "{{ repo_name }}"
+    security_issues: []
+    critical_vulns: 0
+    high_vulns:     0
+    build_status:   "pending"
+    deploy_ok:      false
+
+
+- name: Set backup tag
+  set_fact:
+    backup_tag: "{{ timestamp }}"
+
+- name: Set backup directories
+  set_fact:
+    service_backup_dir: "{{ backup_dir }}"
+    backup_target_dir: "{{ backup_dir }}/{{ backup_tag }}"
+
+- name: Ensure backup directory exists
+  file:
+    path: "{{ backup_target_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Backup existing image if exists
+  block:
+    - name: Check for existing image
+      community.docker.docker_image_info:
+        name: "{{ service_image }}"
+      register: old_image
+      ignore_errors: yes
+      environment: "{{ docker_env }}"
+
+    - name: Set backup image name
+      set_fact:
+        image_name_only: "{{ service_image.split(':')[0] }}"
+
+    - name: Tag old image as backup with timestamp
+      command: >
+        docker tag {{ service_image }} {{ image_name_only }}:{{ backup_tag }}
+      when: old_image.images | length > 0
+      environment: "{{ docker_env }}"
+
+
+
+    - name: Call backup-latest endpoint with existing token
+      uri:
+        url: "{{ backend_base_url }}/images/backup-latest"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ backend_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          repo_name: "{{ repo_name }}"
+          service_image: "{{ service_image }}"
+          backup_tag: "{{ backup_tag }}"
+        status_code: 200
+        return_content: yes
+      register: backup_resp
+
+    - name: Save old image to backup_dir (.tar)
+      shell: >
+        docker save {{ image_name_only }}:{{ backup_tag }}
+        -o "{{ backup_target_dir }}/{{ service }}_{{ backup_tag }}.tar"
+      args:
+        executable: /bin/bash
+      when: old_image.images | length > 0
+      environment: "{{ docker_env }}"
+
+    - name: Backup repo_dir to backup folder
+      copy:
+        src: "{{ repo_dir }}/"
+        dest: "{{ backup_target_dir }}/"
+        remote_src: yes
+      when: old_image.images | length > 0
+
+  rescue:
+    - debug:
+        msg: "No existing image for {{ service }}"
+
+- name: Build Docker image for {{ repo_name }}
+  community.docker.docker_image:
+    name: "{{ service_image }}"
+    source: build
+    build:
+      path: "{{ repo_dir }}"
+      dockerfile: Dockerfile
+    force_source: true
+  register: build_result
+  environment: "{{ docker_env }}"
+  failed_when: build_result.failed or ('Error' in build_result.msg | default(''))
+
+- name: Set build_status
+  set_fact:
+    build_status: "{{ 'built' if build_result is succeeded else 'failed' }}"
+
+- name: Set manifest_dir
+  set_fact:
+    manifest_dir: "{{ repo_dir }}/k8s"
+
+- name: Find all manifest files
+  set_fact:
+    manifest_files: "{{ lookup('fileglob', manifest_dir + '/*.yaml', wantlist=True) }}"
+
+- name: Delete existing Kubernetes resources for {{ repo_name }}
+  community.kubernetes.k8s:
+    kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
+    state: absent
+    definition: "{{ lookup('file', item) }}"
+  loop: "{{ manifest_files }}"
+  when: build_status == 'built'
+  ignore_errors: true
+
+- name: Apply all Kubernetes manifests for {{ repo_name }}
+  community.kubernetes.k8s:
+    kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
+    state: present
+    definition: "{{ lookup('file', item) }}"
+  loop: "{{ manifest_files }}"
+  when: build_status == 'built'
+
+- name: Wait for Deployment {{ repo_name }} to be available
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ repo_name }}"
+    namespace: default
+  register: dep_info
+  until: >-
+    (dep_info.resources[0].status.availableReplicas | default(0))
+      == (dep_info.resources[0].spec.replicas | default(1))
+  retries: 5
+  delay: 6
+  when: build_status == 'built'
+
+- name: Set deploy_ok flag
+  set_fact:
+    deploy_ok: true
+  when: build_status == 'built'
+
+- name: Run security checks
+  include_tasks: security_checks.yml
+  when:
+    - build_status == 'built'
+    - deploy_ok
+  vars:
+    target_container: "{{ repo_name }}"
+    target_image: "{{ service_image }}"
+
+- name: Set service status
+  set_fact:
+    service_status: >-
+      {% if build_status != 'built' %}
+        build-failed
+      {% elif not deploy_ok %}
+        deploy-failed
+      {% elif security_issues or critical_vulns|int > 0 or high_vulns|int > 0 %}
+        waiting-for-approve
+      {% else %}
+        approved
+      {% endif %}
+
+# FIX: Add explicit trim and ensure no extra whitespace
+- name: Clean service status
+  set_fact:
+    service_status: "{{ service_status | trim }}"
+
+- name: Build service summary
+  set_fact:
+    service_summary:
+      build_status: "{{ build_status }}"
+      status: "{{ service_status }}"  # Now properly trimmed
+      security_checks:
+        resource_limits: "{{ resource_check | default('N/A') }}"
+        network: "{{ network_check | default('N/A') }}"
+        privileges: "{{ privileges_check | default('N/A') }}"
+        rootless: "{{ rootless_check | default('N/A') }}"
+        healthcheck: "{{ healthcheck_check | default('N/A') }}"
+      critical_vulns: "{{ critical_vulns }}"
+      high_vulns: "{{ high_vulns }}"
+      issues: "{{ security_issues }}"
+      image_source: "{{ 'Locally built' if build_status == 'built' else service_config.image }}"
+      backup_tag: "{{ backup_tag }}"
+
+- name: Update global service summaries
+  set_fact:
+    service_summaries: "{{ service_summaries | combine({service: service_summary}) }}"
+
+- name: Tag and push if approved
+  include_tasks: tag_and_push.yml
+  when:
+    - build_status == 'built'
+    - service_status == "approved"
+
+- name: Get image ID
+  command: docker images -q "{{ service_image }}:latest"
+  register: image_id_result
+  changed_when: false
+  environment: "{{ docker_env }}"
+
+- name: Log deployment status
+  shell: |
+    mkdir -p /var/log/dockerflow
+    echo "$(date +'%Y-%m-%d %H:%M:%S'),{{ repo_name }},{{ service_status }},{{ image_id_result.stdout }}" \
+      >> /var/log/dockerflow/history.csv
+[admin@flowmaster test]$
