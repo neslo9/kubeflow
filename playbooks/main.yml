@@ -101,4 +101,3 @@
       copy:
         content: "{{ service_summaries | to_nice_json }}"
         dest: "/var/log/dockerflow/{{ project }}_{{ repo_name }}_{{ timestamp }}.log"
-[admin@flowmaster test]$
