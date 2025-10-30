@@ -1,0 +1,146 @@
+---
+- name: Set kubeconfig path and context variables
+  set_fact:
+    kubeconfig_path: "{{ lookup('env', 'HOME') + '/.kube/config' }}"
+    kube_context: "minikube"
+
+- name: Get Deployment info from Kubernetes API
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    namespace: default
+    name: "{{ repo_name }}"
+    kubeconfig: "{{ kubeconfig_path }}"
+    context: "{{ kube_context }}"
+  register: deployment_info
+
+- name: Fail if deployment not found
+  fail:
+    msg: "Deployment {{ repo_name }} not found!"
+  when: deployment_info.resources | length == 0
+
+- name: Set deployment spec variable
+  set_fact:
+    dep_spec: "{{ deployment_info.resources[0].spec }}"
+
+- name: Set pod spec variable
+  set_fact:
+    pod_spec: "{{ dep_spec.template.spec }}"
+
+- name: Set container variable
+  set_fact:
+    container: "{{ pod_spec.containers[0] }}"
+
+- name: Initialize security check statuses
+  set_fact:
+    resource_check: "OK"
+    network_check: "OK"
+    privileges_check: "OK"
+    rootless_check: "OK"
+    healthcheck_check: "OK"
+
+- name: Check resource limits and requests
+  set_fact:
+    resource_check: >-
+      {{
+        (container.resources is defined)
+        and (container.resources.limits.cpu is defined)
+        and (container.resources.limits.memory is defined)
+        and (container.resources.requests.cpu is defined)
+        and (container.resources.requests.memory is defined)
+      }}
+- name: Format resource_check
+  set_fact:
+    resource_check: "{{ 'OK' if resource_check else 'FAILED' }}"
+
+- name: Check privileges/securityContext
+  set_fact:
+    privileges_check: >-
+      {{
+        (pod_spec.securityContext is defined and pod_spec.securityContext.runAsNonRoot | default(false))
+        and (container.securityContext is defined)
+        and (container.securityContext.allowPrivilegeEscalation == false)
+        and (container.securityContext.privileged == false)
+        and ('ALL' in (container.securityContext.capabilities.drop | default([])))
+      }}
+- name: Format privileges_check
+  set_fact:
+    privileges_check: "{{ 'OK' if privileges_check else 'FAILED' }}"
+
+
+- name: Check runs as non-root user
+  set_fact:
+    rootless_check: >-
+      {{
+        (
+          (pod_spec.securityContext.runAsNonRoot | default(false))
+          or (pod_spec.securityContext.runAsUser is defined and pod_spec.securityContext.runAsUser != 0)
+          or (container.securityContext.runAsNonRoot | default(false))
+          or (container.securityContext.runAsUser is defined and container.securityContext.runAsUser != 0)
+        )
+      }}
+
+- name: Format rootless_check
+  set_fact:
+    rootless_check: "{{ 'OK' if rootless_check else 'FAILED' }}"
+
+- name: Check healthchecks configured (liveness and readiness probes)
+  set_fact:
+    healthcheck_check: >-
+      {{
+        (container.livenessProbe is defined)
+        and (container.readinessProbe is defined)
+      }}
+- name: Format healthcheck_check
+  set_fact:
+    healthcheck_check: "{{ 'OK' if healthcheck_check else 'FAILED' }}"
+
+# --- poniżej Twoje oryginalne skany trivy i analiza
+
+- name: Install Trivy if not installed
+  shell: |
+    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+  args:
+    creates: /usr/local/bin/trivy
+
+- name: Scan image for vulnerabilities (JSON)
+  command: trivy image --severity CRITICAL,HIGH -f json {{ target_image }}
+  register: trivy_json
+  failed_when: false
+  changed_when: false
+  environment: "{{ docker_env }}"
+
+- name: Parse Trivy JSON output
+  set_fact:
+    trivy_parsed: "{{ trivy_json.stdout | from_json }}"
+  ignore_errors: yes
+
+- name: Scan image for vulnerabilities (plain output)
+  command: trivy image --severity CRITICAL,HIGH {{ target_image }}
+  register: trivy_raw
+  failed_when: false
+  changed_when: false
+
+- name: Extract CRITICAL & HIGH vulnerabilities
+  set_fact:
+    trivy_vulns: >-
+      {{
+        trivy_parsed.Results
+        | json_query("[].Vulnerabilities[?Severity=='CRITICAL' || Severity=='HIGH']")
+        | sum(start=[])
+      }}
+
+- name: Count CRITICAL/HIGH vulnerabilities
+  set_fact:
+    critical_vulns: "{{ trivy_vulns | selectattr('Severity','equalto','CRITICAL') | list | length }}"
+    high_vulns:     "{{ trivy_vulns | selectattr('Severity','equalto','HIGH')   | list | length }}"
+
+- name: Record vulnerability issues
+  set_fact:
+    security_issues: "{{ security_issues + ['Vuln: ' ~ item.PkgName ~ ' (' ~ item.Severity ~ ')'] }}"
+  loop: "{{ trivy_vulns }}"
+  loop_control:
+    loop_var: item
+  when: trivy_vulns | length > 0
+
+[admin@flowmaster test]$
