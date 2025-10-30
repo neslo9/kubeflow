@@ -1,2 +1,2 @@
-requests
-redis
+requests>=2.20
+redis>=3.5
