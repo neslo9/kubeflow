@@ -1,2 +1,4 @@
-requests>=2.20
-redis>=3.5
+click>=8.0
+tabulate>=0.9
+requests>=2.32
+redis>=7.0
