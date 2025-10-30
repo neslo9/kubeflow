@@ -120,6 +120,7 @@
   register: trivy_raw
   failed_when: false
   changed_when: false
+  environment: "{{ docker_env }}"
 
 - name: Extract CRITICAL & HIGH vulnerabilities
   set_fact:
