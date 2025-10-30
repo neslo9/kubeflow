@@ -1,0 +1,60 @@
+---
+- name: Deploy Kubernetes manifests on Minikube node
+  hosts: "{{ target_hosts | default(project) }}"
+  become: true
+  vars:
+    project: ""       # nazwa projektu / grupa w inventory
+    repo_name: ""
+    tag: ""
+
+  tasks:
+
+    - name: Remove old Kubernetes manifests folder
+      file:
+        path: /home/ansible/k8s-manifests
+        state: absent
+
+
+    - name: Copy Kubernetes manifests from local to remote
+      copy:
+        src: "/home/admin/{{ project }}/backup/{{ repo_name }}/{{ tag }}/k8s/"
+        dest: /home/ansible/k8s-manifests/
+        owner: ansible
+        group: ansible
+        mode: '0644'
+
+    - name: Copy .minikube directory to ansible user
+      copy:
+        src: /home/admin/.minikube/
+        dest: /home/ansible/.minikube/
+        owner: ansible
+        group: ansible
+        mode: '0700'
+        remote_src: true
+
+    - name: Copy kubeconfig to ansible user
+      copy:
+        src: /home/admin/.kube/config
+        dest: /home/ansible/.kube/config
+        owner: ansible
+        group: ansible
+        mode: '0600'
+        remote_src: true
+
+    - name: Replace hardcoded paths in kubeconfig
+      replace:
+        path: /home/ansible/.kube/config
+        regexp: '/home/admin'
+        replace: '/home/ansible'
+
+    - name: Apply Kubernetes manifests using kubectl
+      become_user: ansible
+      shell: kubectl apply -f /home/ansible/k8s-manifests/
+      environment:
+        KUBECONFIG: /home/ansible/.kube/config
+      register: kubectl_apply_output
+
+    - name: Show kubectl output
+      debug:
+        var: kubectl_apply_output.stdout_lines
+
