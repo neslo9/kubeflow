@@ -169,7 +169,7 @@ def run_playbook(job):
     project = job.get("project")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    log_file = os.path.join(LOG_DIR, f"{project}_{repo_name}_{timestamp}_playbook.log")
+    log_file = os.path.join(LOG_DIR, f"{project}_{repo_name}_{image_deploy_id}_playbook.log")
 
     print(f"[{now_iso()}] Running playbook for {project}/{repo_name} (image_deploy_id={image_deploy_id})")
     print(f"[{now_iso()}] Job payload: {job}")
