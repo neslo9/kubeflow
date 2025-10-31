@@ -85,7 +85,7 @@
     - name: Zapisz summaries do JSON dla workera
       copy:
         content: "{{ service_summaries | to_nice_json }}"
-        dest: "/var/log/dockerflow/summaries_{{ deploy_id }}.json"
+        dest: "/var/log/kubeflow/summaries_{{ deploy_id }}.json"
 
     - name: Delete Kubernetes Deployment
       community.kubernetes.k8s:
