@@ -1,158 +1,64 @@
----
-- name: Tag, push Docker image to Harbor, update DB and Kubernetes manifests
+- name: Tag and push Docker image to Harbor
   hosts: localhost
   connection: local
   gather_facts: no
-  vars:
-    harbor_url:       "harbor.app.kubeflow.masternode:30002"
-    project:          "{{ project }}"
-    service_name:     "{{ service_name }}"
-    target_image:     "{{ target_image }}"
-    service_tag:      "{{ service_tag }}"
-    requested_tag:    "{{ new_tag | default('') }}"
-    docker_env:
-      DOCKER_HOST:       tcp://192.168.49.2:2376
-      DOCKER_TLS_VERIFY: "1"
-      DOCKER_CERT_PATH:  "/home/admin/.minikube/certs"
 
-    main_dir:              "/home/admin/{{ project }}/{{ service_name }}"
-    backup_dir:            "/home/admin/{{ project }}/backup/{{ service_name }}"
-    backup_manifest_dir:   "{{ backup_dir }}/{{ service_tag }}"
-    live_manifest:         "/path/to/live/deployment.yaml"  # <-- upewnij się, że istnieje
+  vars:
+    harbor_url: "{{ harbor_url }}"
+    project: "{{ project }}"
+    service_name: "{{ service_name }}"
+    target_image: "{{ target_image }}"
+    service_tag:  "{{ service_tag }}"
+    # Jeśli nie podasz, to będzie użyty new_tag z Harbora po obliczeniu
+    new_tag: ""
 
   tasks:
-    - name: Change manifest permission
-      become: yes
-      ansible.builtin.file:
-        path: "{{ item }}"
-        owner: admin
-        group: admin
-        mode: '0644'
-        state: file
-      loop:
-        - "{{ live_manifest }}"
-        - "{{ backup_manifest_dir }}/deployment.yaml"
-      ignore_errors: yes
-
-    - name: Get repository info (artifacts) from Harbor
+    - name: Get artifact count from Harbor
       uri:
-        url: "http://{{ harbor_url }}/api/v2.0/projects/{{ project }}/repositories/{{ service_name }}/artifacts?page=1&page_size=100&with_tag=true"
+        url: "http://{{ harbor_url }}/api/v2.0/repositories?q=name={{ project }}/{{ service_name }}"
         method: GET
-        user: admin
-        password: "Olsen!eu4!cod"
+        user: "admin"
         force_basic_auth: yes
         status_code: 200
         validate_certs: no
       register: harbor_repo_info
       changed_when: false
-      ignore_errors: yes
 
-    - name: Calculate next version from artifact count (safe)
+    - name: Calculate next version from artifact_count
       set_fact:
-        next_version: "{{ (harbor_repo_info.json | default([]) | length) + 1 }}"
+        next_version: "{{ (harbor_repo_info.json[0].artifact_count | default(0) | int) + 1 }}"
 
-    - name: Decide approved_tag (override or v<next>)
+    - name: Set new tag if not already provided
       set_fact:
-        approved_tag: "{{ requested_tag if requested_tag != '' else 'v' ~ next_version }}"
+        new_tag: "{{ new_tag if new_tag else 'v' + next_version|string }}"
 
-    - name: Build remote_image variable
+    - name: Set remote image using new_tag
       set_fact:
-        remote_image: "{{ harbor_url }}/{{ project }}/{{ service_name }}:{{ approved_tag }}"
+        remote_image: "{{ harbor_url }}/{{ project }}/{{ service_name }}:{{ new_tag }}"
 
-    - name: Tag image for Harbor (do not fail whole playbook if this fails)
+    - name: Debug tagging info
+      debug:
+        msg: "Tagging image '{{ target_image }}' as '{{ remote_image }}' (new_tag={{ new_tag }})"
+
+    - name: Tag image for Harbor
       command: docker tag "{{ target_image }}" "{{ remote_image }}"
-      environment: "{{ docker_env }}"
-      register: tag_cmd
-      failed_when: false
-      changed_when: tag_cmd.rc == 0
 
-    - name: Debug tag result
-      debug:
-        msg: "docker tag rc={{ tag_cmd.rc }} stdout={{ tag_cmd.stdout | default('') }} stderr={{ tag_cmd.stderr | default('') }}"
-
-    - name: Push image to Harbor (do not fail whole playbook if this fails)
+    - name: Push image to Harbor
       command: docker push "{{ remote_image }}"
-      environment: "{{ docker_env }}"
-      register: push_cmd
-      failed_when: false
-      changed_when: push_cmd.rc == 0
+      environment:
+        DOCKER_CONFIG: "/home/admin/.docker"
 
-    - name: Debug push result
-      debug:
-        msg: "docker push rc={{ push_cmd.rc }} stdout={{ push_cmd.stdout | default('') }} stderr={{ push_cmd.stderr | default('') }}"
-
-    - name: Check if backup folder exists
-      become: yes
-      ansible.builtin.stat:
-        path: "{{ backup_dir }}/{{ service_tag }}"
-      register: backup_dir_stat
-      ignore_errors: yes
-
-    - name: Check if main_dir exists
-      become: yes
-      ansible.builtin.stat:
-        path: "{{ main_dir }}"
-      register: main_dir_stat
-      ignore_errors: yes
-
-    - name: Copy main_dir to backup folder with approved_tag
-      become: yes
-      ansible.builtin.command:
-        cmd: cp -r "{{ main_dir }}" "{{ backup_dir }}/{{ approved_tag }}"
-      when: main_dir_stat.stat.exists | default(false)
-      ignore_errors: yes
-
-    - name: Rename backup folder from service_tag to approved_tag
-      become: yes
-      ansible.builtin.command:
-        cmd: mv "{{ backup_dir }}/{{ service_tag }}" "{{ backup_dir }}/{{ approved_tag }}"
-      when:
-        - "'latest' not in service_tag"
-        - backup_dir_stat.stat.exists | default(false)
-      ignore_errors: yes
-
-    - name: Update backup manifest with new image
-      become: yes
-      ansible.builtin.replace:
-        path: "{{ backup_dir }}/{{ approved_tag }}/k8s/deployment.yaml"
-        regexp: '(^\s*image:\s*).+'
-        replace: '\1{{ remote_image }}'
-        backup: yes
-      ignore_errors: yes
-
-    - name: Remove local Docker image
-      become: yes
-      command: docker rmi "{{ target_image }}"
-      environment: "{{ docker_env }}"
-      ignore_errors: yes
-
-    # --- Ensure output file dir exists and then write tag ---
-    - name: Compute final output file (defaults to /tmp/approved_tag.txt)
-      set_fact:
-        final_output: "{{ output_file | default('/tmp/approved_tag.txt') }}"
-
-    - name: Compute output dir (strip filename)
-      set_fact:
-        output_dir: "{{ final_output | regex_replace('/[^/]+$','') }}"
-
-    - name: Ensure output directory exists
-      ansible.builtin.file:
-        path: "{{ output_dir }}"
-        state: directory
-        mode: '0755'
-
-    - name: Save approved_tag to file (always try to write)
-      ansible.builtin.copy:
-        dest: "{{ final_output }}"
-        content: "{{ approved_tag }}"
-        mode: '0644'
-      ignore_errors: yes
-
-    - name: Debug approved_tag
-      debug:
-        msg:
-          - "approved_tag={{ approved_tag }}"
-          - "final_output={{ final_output }}"
-          - "tag_cmd_rc={{ tag_cmd.rc | default('NA') }}"
-          - "push_cmd_rc={{ push_cmd.rc | default('NA') }}"
-
+    - name: Update deploy_status to approved in service_details
+      community.postgresql.postgresql_query:
+        db: "{{ DB_NAME }}"
+        login_host: "{{ DB_HOST }}"
+        login_port: "{{ DB_PORT | int }}"
+        login_user: "{{ DB_USER }}"
+        login_password: "{{ DB_PASSWORD }}"
+        query: |
+          UPDATE service_details
+          SET deploy_status = 'approved',
+              image_tag = '{{ new_tag }}'
+          WHERE image_name = '{{ service_name }}'  -- lub inna kolumna na repo
+            AND deploy_status != 'approved'
+            AND image_tag = '{{ service_tag }}'
