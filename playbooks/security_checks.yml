@@ -53,19 +53,23 @@
   set_fact:
     resource_check: "{{ 'OK' if resource_check else 'FAILED' }}"
 
-- name: Check privileges/securityContext
+- name: Check privileges/securityContext (safe)
   set_fact:
     privileges_check: >-
       {{
-        (pod_spec.securityContext is defined and pod_spec.securityContext.runAsNonRoot | default(false))
-        and (container.securityContext is defined)
-        and (container.securityContext.allowPrivilegeEscalation == false)
-        and (container.securityContext.privileged == false)
-        and ('ALL' in (container.securityContext.capabilities.drop | default([])))
+        (
+          (pod_spec.securityContext is defined and (pod_spec.securityContext.runAsNonRoot | default(false)))
+          and (container.securityContext is defined)
+          and ((container.securityContext.allowPrivilegeEscalation | default(true)) == false)
+          and ((container.securityContext.privileged | default(false)) == false)
+          and ('ALL' in (container.securityContext.capabilities.drop | default([])))
+        )
       }}
+
 - name: Format privileges_check
   set_fact:
     privileges_check: "{{ 'OK' if privileges_check else 'FAILED' }}"
+
 
 
 - name: Check runs as non-root user
@@ -143,4 +147,3 @@
   loop_control:
     loop_var: item
   when: trivy_vulns | length > 0
-
