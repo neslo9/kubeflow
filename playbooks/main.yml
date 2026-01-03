@@ -17,7 +17,6 @@
     gitea_url: "gitea.app.kubeflow.masternode:30080"
     token: ""
     backend_base_url: "http://dashboard.app.kubeflow.masternode:30008/"
-    backend_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTc1ODEzMjU5MH0.JxB2lAWv0WLcmJkIx_Nc4BacFq3VCLkWBr3vnOMdMiw"
     expected_network: "{{ repo_name }}_app_net"
     backup_dir: "{{ project_root }}/backup/{{ repo_name }}"
     timestamp: "{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
@@ -45,6 +44,7 @@
         version: main
         force: yes
         update: yes
+      no_log: true
 
 
     - name: Discover all k8s‑service dirs
