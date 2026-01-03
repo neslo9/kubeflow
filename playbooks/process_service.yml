@@ -8,7 +8,6 @@
     build_status:   "pending"
     deploy_ok:      false
 
-
 - name: Set backup tag
   set_fact:
     backup_tag: "{{ timestamp }}"
@@ -42,24 +41,6 @@
         docker tag {{ service_image }} {{ image_name_only }}:{{ backup_tag }}
       when: old_image.images | length > 0
       environment: "{{ docker_env }}"
-
-
-
-    - name: Call backup-latest endpoint with existing token
-      uri:
-        url: "{{ backend_base_url }}/images/backup-latest"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ backend_token }}"
-          Content-Type: "application/json"
-        body_format: json
-        body:
-          repo_name: "{{ repo_name }}"
-          service_image: "{{ service_image }}"
-          backup_tag: "{{ backup_tag }}"
-        status_code: 200
-        return_content: yes
-      register: backup_resp
 
     - name: Save old image to backup_dir (.tar)
       shell: >
@@ -119,6 +100,7 @@
     kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
     state: present
     definition: "{{ lookup('file', item) }}"
+    force: true
   loop: "{{ manifest_files }}"
   when: build_status == 'built'
 
@@ -130,17 +112,77 @@
     name: "{{ repo_name }}"
     namespace: default
   register: dep_info
-  until: >-
+  until: >
     (dep_info.resources[0].status.availableReplicas | default(0))
       == (dep_info.resources[0].spec.replicas | default(1))
   retries: 5
   delay: 6
+  failed_when: false
   when: build_status == 'built'
 
-- name: Set deploy_ok flag
+- name: Determine deploy_ok flag from dep_info
+  set_fact:
+    deploy_ok: "{{ (dep_info.resources is defined and dep_info.resources | length > 0 and
+                    (dep_info.resources[0].status.availableReplicas | default(0))
+                     == (dep_info.resources[0].spec.replicas | default(1))) | bool }}"
+  when: build_status == 'built'
+
+- name: Collect K8s pod logs and fail if deployment not ready
+  block:
+    - name: Get pod name
+      command: >
+        kubectl get pods -n default -l app={{ repo_name }}
+        -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+      failed_when: false
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') }}/.kube/config"
+
+    - name: Get last lines of pod logs
+      command: >
+        kubectl logs {{ pod_name.stdout }} -n default --tail=10
+      register: pod_logs
+      failed_when: false
+      changed_when: false
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') }}/.kube/config"
+
+    - name: Save failed deploy info
+      copy:
+        content: |
+          {
+           "k8s_logs": {{ pod_logs.stdout | default('') | to_json }}
+          }
+        dest: "/var/log/kubeflow/k8s_logs_{{ deploy_id }}.json"
+      changed_when: true
+      when: pod_name.stdout != ''
+
+    - name: Delete Kubernetes Deployment on failed deploy
+      community.kubernetes.k8s:
+        kubeconfig: "{{ lookup('env','HOME') }}/.kube/config"
+        state: absent
+        kind: Deployment
+        name: "{{ repo_name }}"
+        namespace: default
+      ignore_errors: true
+
+    - name: Fail the playbook if deployment not ready
+      fail:
+        msg: >
+          Deployment {{ repo_name }} failed to become available!
+          See pod logs: /var/log/kubeflow/k8s_logs_{{ deploy_id }}.json
+
+  when:
+    - build_status == 'built'
+    - deploy_ok == false
+
+- name: Set deploy_ok flag if deployment succeeded
   set_fact:
     deploy_ok: true
-  when: build_status == 'built'
+  when:
+    - build_status == 'built'
+    - deploy_ok
 
 - name: Run security checks
   include_tasks: security_checks.yml
@@ -151,7 +193,7 @@
     target_container: "{{ repo_name }}"
     target_image: "{{ service_image }}"
 
-- name: Set service status
+- name: Set final service status
   set_fact:
     service_status: >-
       {% if build_status != 'built' %}
@@ -164,7 +206,6 @@
         approved
       {% endif %}
 
-# FIX: Add explicit trim and ensure no extra whitespace
 - name: Clean service status
   set_fact:
     service_status: "{{ service_status | trim }}"
@@ -173,7 +214,7 @@
   set_fact:
     service_summary:
       build_status: "{{ build_status }}"
-      status: "{{ service_status }}"  # Now properly trimmed
+      status: "{{ service_status }}"
       security_checks:
         resource_limits: "{{ resource_check | default('N/A') }}"
         network: "{{ network_check | default('N/A') }}"
