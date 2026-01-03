@@ -5,22 +5,23 @@ import time
 import subprocess
 import requests
 import redis
+import socket
+import re
 from datetime import datetime, timezone
+from typing import Optional, List
 
 # Konfiguracja
 REDIS_URL = os.getenv("REDIS_URL", "redis://192.168.1.101:30079/0")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://dashboard.app.kubeflow.masternode:30008")
 PLAYBOOK_PATH = os.getenv("PLAYBOOK_PATH", "/usr/local/bin/dockerflow_config/playbooks/test/main-dbless.yml")
 ACCEPT_PLAYBOOK_PATH = os.getenv("ACCEPT_PLAYBOOK_PATH", "/usr/local/bin/dockerflow_config/playbooks/test/tag_and_push.yml")
-LOG_DIR = os.getenv("LOG_DIR", "/var/log/dockerflow")
+LOG_DIR = os.getenv("LOG_DIR")
 
 # Token workera (wartość jawna, nie base64)
 WORKER_TOKEN = os.getenv("WORKER_TOKEN")
 
 if not WORKER_TOKEN:
-    # Szybkie zabezpieczenie - nie startujemy bez tokena
     print("ERROR: WORKER_TOKEN not set. Set environment variable WORKER_TOKEN before running the worker.")
-    print("Example: export WORKER_TOKEN='eyJ...'; python worker.py")
     raise SystemExit(1)
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -29,6 +30,7 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def now_iso():
+    """Helper used ONLY for JSON payloads, not for console logging."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -41,14 +43,14 @@ def load_summaries_file(deploy_id):
     """Wczytuje summaries_{deploy_id}.json i normalizuje wynik do listy summary dictów."""
     path = os.path.join(LOG_DIR, f"summaries_{deploy_id}.json")
     if not os.path.exists(path):
-        print(f"[{now_iso()}] Summaries file not found: {path}")
+        print(f"Summaries file not found: {path}")
         return []
 
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as fh:
             data = json.load(fh)
     except Exception as e:
-        print(f"[{now_iso()}] Error loading summaries JSON {path}: {e}")
+        print(f"Error loading summaries JSON {path}: {e}")
         return []
 
     if isinstance(data, dict):
@@ -65,7 +67,7 @@ def load_summaries_file(deploy_id):
                 "image_tag": val.get("image_tag", "latest"),
                 "backup_tag": val.get("backup_tag")
             })
-        print(f"[{now_iso()}] Loaded summaries from JSON file (dict) : {path}")
+        print(f"Loaded summaries from JSON file (dict) : {path}")
         return items
     elif isinstance(data, list):
         normalized = []
@@ -81,10 +83,10 @@ def load_summaries_file(deploy_id):
                 "image_tag": item.get("image_tag", "latest"),
                 "backup_tag": item.get("backup_tag")
             })
-        print(f"[{now_iso()}] Loaded summaries from JSON file (list): {path}")
+        print(f"Loaded summaries from JSON file (list): {path}")
         return normalized
     else:
-        print(f"[{now_iso()}] Unexpected JSON format in {path}, expected dict or list.")
+        print(f"Unexpected JSON format in {path}, expected dict or list.")
         return []
 
 
@@ -101,7 +103,6 @@ def parse_summaries_from_log(log_file_path):
     critical_vulns = None
     high_vulns = None
 
-    import re
     header_re = re.compile(r"^=== Service:\s+(?P<name>.+?)\s+===$")
     build_re = re.compile(r"^Build:\s+(?P<val>\w+)")
     deploy_re = re.compile(r"^Deploy:\s+(?P<val>\w+)")
@@ -158,27 +159,44 @@ def parse_summaries_from_log(log_file_path):
                     continue
             flush_block()
     except Exception as e:
-        print(f"[{now_iso()}] Error parsing playbook log {log_file_path}: {e}")
+        print(f"Error parsing playbook log {log_file_path}: {e}")
 
     return summaries
 
+def load_pod_logs(deploy_id: int) -> Optional[str]:
+    pod_log_file = f"/var/log/kubeflow/k8s_logs_{deploy_id}.json"
+    try:
+        if os.path.exists(pod_log_file):
+            with open(pod_log_file, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            k8s_logs = data.get("k8s_logs")
+            if isinstance(k8s_logs, (list, dict)):
+                return json.dumps(k8s_logs, ensure_ascii=False)
+            return str(k8s_logs) if k8s_logs is not None else None
+        return None
+    except Exception as e:
+        return f"Error reading pod logs: {e}"
 
 def run_playbook(job):
     image_deploy_id = job.get("image_deploy_id") or job.get("deploy_id")
     repo_name = job.get("repo_name")
     project = job.get("project")
-
+    current_worker = socket.gethostname()
+    # Log filenames still need timestamp
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     log_file = os.path.join(LOG_DIR, f"{project}_{repo_name}_{image_deploy_id}_playbook.log")
 
-    print(f"[{now_iso()}] Running playbook for {project}/{repo_name} (image_deploy_id={image_deploy_id})")
-    print(f"[{now_iso()}] Job payload: {job}")
+    print(f"Running playbook for {project}/{repo_name} (image_deploy_id={image_deploy_id})")
+    print(f"Job payload: {job}")
 
     env = os.environ.copy()
     env.update({
         "ANSIBLE_STDOUT_CALLBACK": "default",
         "ANSIBLE_HOST_KEY_CHECKING": "False"
     })
+    
+    # Ensure backend_token is passed if needed, currently reading from env inside script but passed as arg too
+    backend_token_arg = os.getenv("WORKER_TOKEN", "")
 
     cmd = [
         "ansible-playbook",
@@ -186,6 +204,7 @@ def run_playbook(job):
         "-e", f"repo_name={repo_name}",
         "-e", f"project={project}",
         "-e", f"deploy_id={image_deploy_id}",
+        "-e", f"backend_token={backend_token_arg}",
         "-vv"
     ]
 
@@ -194,11 +213,11 @@ def run_playbook(job):
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             retcode = result.returncode
     except Exception as e:
-        print(f"[{now_iso()}] Error running playbook command: {e}")
+        print(f"Error running playbook command: {e}")
         retcode = 2
 
     status = "success" if retcode == 0 else "failed"
-    print(f"[{now_iso()}] Playbook finished with status: {status}, log: {log_file}")
+    print(f"Playbook finished with status: {status}, log: {log_file}")
 
     summaries = load_summaries_file(image_deploy_id)
     if not summaries:
@@ -209,16 +228,72 @@ def run_playbook(job):
         "timestamp": now_iso(),
         "log_file": log_file,
         "summaries": summaries,
+        "worker": current_worker
     }
 
-    print(f"[{now_iso()}] Sending payload to backend for image_deploy_id={image_deploy_id}")
+    print(f"Sending payload to backend for image_deploy_id={image_deploy_id}")
     try:
         url = f"{BACKEND_URL}/images/{image_deploy_id}/complete"
         resp = requests.post(url, json=payload, headers=headers_with_auth(), timeout=30)
-        print(f"[{now_iso()}] Backend response: {resp.status_code} {getattr(resp, 'text', '')}")
+        print(f"Backend response: {resp.status_code} {getattr(resp, 'text', '')}")
     except Exception as e:
-        print(f"[{now_iso()}] Error updating backend: {e}")
+        print(f"Error updating backend: {e}")
 
+    # -------------------------
+    # Failed logs handling
+    # -------------------------
+    if status != "success" or not summaries:
+        print(f"Deploy failed or missing summaries -> preparing failed logs payload")
+
+        whole_log_ctx = ""
+        try:
+            if os.path.exists(log_file):
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    whole_log_ctx = f.read()
+        except Exception:
+            whole_log_ctx = ""
+
+        failed_task_info = "unknown task"
+        last_playbook_lines = ""
+
+        task_re = re.compile(r"^TASK \[(?P<task>.+?)\]", re.MULTILINE)
+        fatal_re = re.compile(r"fatal: .*FAILED!", re.IGNORECASE)
+
+        matches = list(task_re.finditer(whole_log_ctx))
+        if matches:
+            for m in reversed(matches):
+                task_start = m.start()
+                next_task_start = len(whole_log_ctx)
+                idx = matches.index(m)
+                if idx + 1 < len(matches):
+                    next_task_start = matches[idx + 1].start()
+                task_block = whole_log_ctx[task_start:next_task_start]
+                if fatal_re.search(task_block):
+                    failed_task_info = f"TASK [{m.group('task')}]"
+                    fatal_lines = [l for l in task_block.splitlines() if fatal_re.search(l)]
+                    if fatal_lines:
+                        last_playbook_lines = fatal_lines[-1].strip()
+                    else:
+                        last_playbook_lines = task_block[-200:]
+                    break
+
+        if not last_playbook_lines:
+            last_playbook_lines = whole_log_ctx[-200:]
+
+        pod_log_lines = load_pod_logs(image_deploy_id)
+
+        failed_payload = {
+            "failed_task_info": failed_task_info,
+            "last_playbook_lines": last_playbook_lines,
+            "pod_log_lines": pod_log_lines,
+        }
+
+        try:
+            url = f"{BACKEND_URL}/image_test_pipeline/{image_deploy_id}/update-logs"
+            resp = requests.post(url, json=failed_payload, headers=headers_with_auth(), timeout=30)
+            print(f"/update-logs backend response: {resp.status_code} {getattr(resp, 'text', '')}")
+        except Exception as e:
+            print(f"Error sending failed logs to backend: {e}")
 
 def run_accept(job):
     image_details_id = job.get("image_details_id")
@@ -232,8 +307,8 @@ def run_accept(job):
     log_file = os.path.join(LOG_DIR, f"{project}_{service_name}_{timestamp}_accept.log")
     tag_output_file = os.path.join(LOG_DIR, f"{project}_{service_name}_{timestamp}_tag.txt")
 
-    print(f"[{now_iso()}] Accept job for {project}/{service_name} (id={image_details_id})")
-    print(f"[{now_iso()}] Job payload: {job}")
+    print(f"Accept job for {project}/{service_name} (id={image_details_id})")
+    print(f"Job payload: {job}")
 
     env = os.environ.copy()
     env.update({
@@ -259,7 +334,7 @@ def run_accept(job):
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             result_code = result.returncode
     except Exception as e:
-        print(f"[{now_iso()}] Error running accept playbook: {e}")
+        print(f"Error running accept playbook: {e}")
         result_code = 2
 
     tag = None
@@ -270,57 +345,46 @@ def run_accept(job):
                 tag = tf.read().strip()
             success = bool(tag)
         except Exception as e:
-            print(f"[{now_iso()}] Error reading tag file: {e}")
+            print(f"Error reading tag file: {e}")
             success = False
     else:
-        print(f"[{now_iso()}] Playbook failed or tag file missing (rc={result_code})")
+        print(f"Playbook failed or tag file missing (rc={result_code})")
 
-    print(f"[{now_iso()}] Accept playbook returncode: {result_code}")
+    print(f"Accept playbook returncode: {result_code}")
 
-    # Kompatybilny URL z FastAPI endpointem /accept/complete/{image_details_id}
     payload = {
         "image_details_id": image_details_id,
         "tag": tag,
         "success": success
     }
 
-    print(f"[{now_iso()}] Sending accept payload for image_details_id={image_details_id}: {payload}")
+    print(f"Sending accept payload for image_details_id={image_details_id}: {payload}")
     try:
         url = f"{BACKEND_URL}/images/accept/complete/{image_details_id}"
         response = requests.post(url, json=payload, headers=headers_with_auth(), timeout=30)
-        print(f"[{now_iso()}] Backend response: {response.status_code} {getattr(response, 'text', '')}")
+        print(f"Backend response: {response.status_code} {getattr(response, 'text', '')}")
     except Exception as e:
-        print(f"[{now_iso()}] Error reporting accept status: {e}")
+        print(f"Error reporting accept status: {e}")
 
 # === [NEW SECTION] pods_deployment_queue support ===
 
 def run_pods_deploy(job):
-    """
-    Obsługa kolejki pods_deployment_queue — deploy podów na wskazanych nodach.
-    Uwaga: ta wersja:
-     - filtruje puste hosty,
-     - sprawdza inventory i playbook,
-     - loguje pełne polecenie i fragment logu,
-     - wykrywa przypadki "no hosts matched" / brak PLAY w logu.
-    """
     deploy_id = job.get("deploy_id")
     project = job.get("project")
     repo_name = job.get("repo_name")
     tag = job.get("tag", "latest")
-    # filtrowanie pustych wpisów
     hosts = [h.strip() for h in job.get("hosts", []) if h and h.strip()]
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     log_file = os.path.join(LOG_DIR, f"{project}_{repo_name}_{timestamp}_pods_deploy.log")
 
-    print(f"[{now_iso()}] [pods_deploy] Start deploy for {project}/{repo_name}, tag={tag}, hosts={hosts}")
+    print(f"[pods_deploy] Start deploy for {project}/{repo_name}, tag={tag}, hosts={hosts}")
 
     inventory_file = os.getenv("INVENTORY_FILE", "/etc/ansible/hosts")
-    playbook_path = os.getenv("PODS_DEPLOY_PLAYBOOK", "/usr/local/bin/dockerflow_config/playbooks/test/deploy_on_node.yml")
+    playbook_path = os.getenv("PODS_DEPLOY_PLAYBOOK", "/usr/local/bin/kube/playbooks/deploy_on_node.yml")
 
-    # weryfikacja plików
     if not os.path.exists(playbook_path):
         msg = f"Playbook not found: {playbook_path}"
-        print(f"[{now_iso()}] [pods_deploy] {msg}")
+        print(f"[pods_deploy] {msg}")
         payload = {"deployment_id": deploy_id, "project": project, "repo_name": repo_name, "hosts": hosts, "tag": tag, "success": False, "reason": msg}
         try:
             requests.post(f"{BACKEND_URL}/deploy/complete/{deploy_id}", json=payload, headers=headers_with_auth(), timeout=10)
@@ -330,7 +394,7 @@ def run_pods_deploy(job):
 
     if not os.path.exists(inventory_file):
         msg = f"Inventory not found: {inventory_file}"
-        print(f"[{now_iso()}] [pods_deploy] {msg}")
+        print(f"[pods_deploy] {msg}")
         payload = {"deployment_id": deploy_id, "project": project, "repo_name": repo_name, "hosts": hosts, "tag": tag, "success": False, "reason": msg}
         try:
             requests.post(f"{BACKEND_URL}/deploy/complete/{deploy_id}", json=payload, headers=headers_with_auth(), timeout=10)
@@ -338,7 +402,6 @@ def run_pods_deploy(job):
             pass
         return
 
-    # przygotowanie polecenia
     cmd = ["ansible-playbook", "-i", inventory_file, playbook_path]
     if hosts:
         limit_hosts = ",".join(hosts)
@@ -351,28 +414,25 @@ def run_pods_deploy(job):
         "ANSIBLE_HOST_KEY_CHECKING": "False"
     })
 
-    # logujemy polecenie
-    print(f"[{now_iso()}] [pods_deploy] CMD: {' '.join(cmd)}")
+    print(f"[pods_deploy] CMD: {' '.join(cmd)}")
     try:
         with open(log_file, "w", encoding="utf-8", errors="ignore") as f:
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
             rc = result.returncode
     except Exception as e:
         rc = 2
-        print(f"[{now_iso()}] [pods_deploy] Error running pods deploy: {e}")
+        print(f"[pods_deploy] Error running pods deploy: {e}")
 
-    # odczyt fragmentu logu dla szybkiego podglądu
     log_snippet = ""
     try:
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
             lines = content.splitlines()
-            log_snippet = "\n".join(lines[-200:])  # ostatnie 200 linii
+            log_snippet = "\n".join(lines[-200:])
     except Exception as e:
         content = ""
-        print(f"[{now_iso()}] [pods_deploy] Could not read log file: {e}")
+        print(f"[pods_deploy] Could not read log file: {e}")
 
-    # heurystyka: Ansible może zwrócić rc=0 ale nie wykonać nic (np. "No hosts matched")
     reason = None
     success = (rc == 0)
 
@@ -381,13 +441,11 @@ def run_pods_deploy(job):
             success = False
             reason = "no hosts matched / nothing executed"
     else:
-        # szukamy konkretnych błędów
         if "UNREACHABLE!" in content or "FAILED!" in content:
             reason = "hosts unreachable or tasks failed"
         else:
             reason = f"ansible return code {rc}"
 
-    # payload do backendu z fragmentem logu i powodem
     payload = {
         "deployment_id": deploy_id,
         "project": project,
@@ -403,41 +461,53 @@ def run_pods_deploy(job):
 
     try:
         url = f"{BACKEND_URL}/deploy/complete/{deploy_id}"
-        print(f"[{now_iso()}] [pods_deploy] Sending callback to {url} (success={success})")
+        print(f"[pods_deploy] Sending callback to {url} (success={success})")
         resp = requests.post(url, json=payload, headers=headers_with_auth(), timeout=30)
-        print(f"[{now_iso()}] [pods_deploy] Backend response: {resp.status_code} {getattr(resp, 'text', '')}")
+        print(f"[pods_deploy] Backend response: {resp.status_code} {getattr(resp, 'text', '')}")
     except Exception as e:
-        print(f"[{now_iso()}] [pods_deploy] Error sending callback: {e}")
+        print(f"[pods_deploy] Error sending callback: {e}")
 
 def main():
-    print(f"[{now_iso()}] Worker started, listening on Redis queues")
-    queues = ["image_test_queue", "image_accept_queue", "pods_deployment_queue"]
+    my_hostname = socket.gethostname()
+    print(f"Worker started on: {my_hostname}")
+
+    queues_to_watch = [
+        f"image_accept_queue:{my_hostname}",
+        f"pods_deployment_queue:{my_hostname}",
+        "image_test_queue"
+    ]
+
+    print(f"Listening on: {queues_to_watch}")
 
     while True:
         try:
-            popped = r.brpop(queues, timeout=5)
+            popped = r.brpop(queues_to_watch, timeout=5)
             if not popped:
                 continue
-            queue_name, job_json = popped
+
+            full_queue_name, job_json = popped
+
+            if isinstance(full_queue_name, bytes):
+                full_queue_name = full_queue_name.decode('utf-8')
+
             try:
                 job = json.loads(job_json)
             except Exception:
-                print(f"[{now_iso()}] Invalid job JSON from {queue_name}: {job_json}")
+                print(f"Invalid JSON in {full_queue_name}")
                 continue
 
-            if queue_name == "image_test_queue":
+            if full_queue_name == "image_test_queue":
                 run_playbook(job)
-            elif queue_name == "image_accept_queue":
+            elif full_queue_name.startswith("image_accept_queue"):
                 run_accept(job)
-            elif queue_name == "pods_deployment_queue":
+            elif full_queue_name.startswith("pods_deployment_queue"):
                 run_pods_deploy(job)
             else:
-                print(f"[{now_iso()}] Unknown queue {queue_name}")
+                print(f"Unknown queue type: {full_queue_name}")
 
         except Exception as e:
-            print(f"[{now_iso()}] Worker error: {e}")
+            print(f"Worker critical error: {e}")
             time.sleep(5)
-
 
 if __name__ == "__main__":
     main()
