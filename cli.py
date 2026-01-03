@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 CLI tool for KuberFlow Dashboard
@@ -218,6 +217,45 @@ class DockerFlowCLI:
             click.echo(f"Connection error: {e}")
             return False
 
+    # ---------------- Repositories (new) ----------------
+    def get_repositories(self):
+        headers = self.get_headers()
+        try:
+            url = f"{self.base_url}/repository/"
+            resp = self.session.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                click.echo(f"Failed to list repositories: {resp.status_code} {resp.text}")
+                return None
+        except requests.exceptions.RequestException as e:
+            click.echo(f"Connection error: {e}")
+            return None
+
+    def create_repository(self, name: str, project: Optional[str], private: bool = True, use_template: bool = True) -> bool:
+        headers = self.get_headers()
+        payload = {"name": name, "private": bool(private), "use_template": bool(use_template)}
+        if project is not None:
+            # if project looks like an int -> send project_id else project_name
+            try:
+                pid = int(project)
+                payload["project_id"] = pid
+            except Exception:
+                payload["project_name"] = project
+        try:
+            url = f"{self.base_url}/repository/"
+            resp = self.session.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                click.echo(f"Repository '{name}' created (id: {data.get('id')}, from_template: {data.get('from_template')})")
+                return True
+            else:
+                click.echo(f"Failed to create repository: {resp.status_code} {resp.text}")
+                return False
+        except requests.exceptions.RequestException as e:
+            click.echo(f"Connection error: {e}")
+            return False
+
     # ---------------- Admin helpers ----------------
     def ensure_admin(self):
         info = self.get_user_info()
@@ -238,7 +276,7 @@ class DockerFlowCLI:
                 if not users:
                     click.echo("No users found")
                     return
-                table = [[u.get("id"), u.get("username"), u.get("project_id"), u.get("is_admin")] for u in users]
+                table = [[u.get("id"), u.get("username"), u.get("project"), u.get("is_admin")] for u in users]
                 # sort descending by ID
                 table.sort(key=lambda x: x[0], reverse=True)
                 click.echo(tabulate(table, headers=["ID", "Username", "Project ID", "Admin"], tablefmt="presto"))
@@ -249,11 +287,58 @@ class DockerFlowCLI:
         except requests.exceptions.RequestException as e:
             click.echo(f"Connection error: {e}")
 
-    def adm_create_user(self, username: str, password: str, project_id: int, is_admin: bool):
+    def adm_create_project(self, name: str):
+        """Create a new project"""
         try:
             self.ensure_admin()
             headers = self.get_headers()
-            data = {"username": username, "password": password, "project_id": int(project_id), "is_admin": bool(is_admin)}
+            data = {"name": name}
+            url = f"{self.base_url}/project/"
+            resp = self.session.post(url, json=data, headers=headers)
+            if resp.status_code in (200, 201):
+                payload = resp.json()
+                click.echo(f"Project '{name}' created (id: {payload.get('id')})")
+            else:
+                click.echo(f"Failed to create project: {resp.status_code} {resp.text}")
+        except click.ClickException as ce:
+            click.echo(str(ce))
+        except requests.exceptions.RequestException as e:
+            click.echo(f"Connection error: {e}")
+
+    def adm_list_projects(self):
+        """List projects via GET /project/ (admin only)"""
+        try:
+            self.ensure_admin()
+            headers = self.get_headers()
+            url = f"{self.base_url}/project/"
+            resp = self.session.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                projects = resp.json()
+                if not projects:
+                    click.echo("No projects found")
+                    return
+                # projects expected to be list of {"id":..., "name":...}
+                rows = [[p.get("id"), p.get("name")] for p in projects]
+                rows.sort(key=lambda x: x[0] or 0, reverse=True)
+                click.echo(tabulate(rows, headers=["ID", "Name"], tablefmt="presto"))
+            else:
+                click.echo(f"Failed to list projects: {resp.status_code} {resp.text}")
+        except click.ClickException as ce:
+            click.echo(str(ce))
+        except requests.exceptions.RequestException as e:
+            click.echo(f"Connection error: {e}")
+
+    def adm_create_user(self, username: str, password: str, project: str, email: str, is_admin: bool):
+        try:
+            self.ensure_admin()
+            headers = self.get_headers()
+            data = {
+                "username": username,
+                "password": password,
+                "project": project,
+                "email": email,
+                "is_admin": bool(is_admin)
+            }
             resp = self.session.post(f"{self.base_url}/users", json=data, headers=headers)
             if resp.status_code in (200, 201):
                 payload = resp.json()
@@ -348,6 +433,7 @@ def get(ctx):
         click.echo("       - images/image/img - shows images that pass image test pipeline")
         click.echo("       - imagetestpipeline/itp - shows triggered image pipelines")
         click.echo("       - deployments/deployment/deploy - shows images that are deployed")
+        click.echo("       - repo/repos/repositories - list repositories")
         return
 
 # ---------------- get image (primary) ----------------
@@ -394,14 +480,17 @@ get.add_command(get_image_cmd, name="img")
 
 
 # ---------------- get imagetestpipeline ----------------
-@click.command("imagetestpipeline")
+
+@get.command("imagetestpipeline")
 @click.argument("arg", required=False)
 @click.option("--raw", is_flag=True, default=False, help="Print raw JSON from API instead of formatted table")
 @click.pass_context
 def get_imagetestpipeline_cmd(ctx, arg, raw):
+    """Show Image Test Pipeline (ITP)"""
     cli_instance: DockerFlowCLI = ctx.obj
 
     if not arg:
+        # lista grup/deploymentów
         groups = cli_instance.get_image_test_pipeline()
         if not groups:
             click.echo("No ImageTestPipeline groups found")
@@ -413,10 +502,11 @@ def get_imagetestpipeline_cmd(ctx, arg, raw):
             click.echo(json.dumps(groups, indent=2, ensure_ascii=False))
         return
 
+    # argument ma format repo/deploy_id
     if "/" in arg:
         parts = arg.split("/")
         if len(parts) != 2:
-            click.echo("Invalid format, use <repo>/<id>")
+            click.echo("Invalid format, use <repo>/<deploy_id>")
             return
         repo, deploy_id = parts
         details = cli_instance.get_image_test_pipeline(group=repo, deploy_id=deploy_id)
@@ -428,15 +518,10 @@ def get_imagetestpipeline_cmd(ctx, arg, raw):
             click.echo(json.dumps(details, indent=2, ensure_ascii=False))
             return
 
-        if isinstance(details, dict):
-            print_deployment_details(details)
-        elif isinstance(details, list):
-            for d in details:
-                print_deployment_details(d)
-                click.echo("")
-        else:
-            click.echo(json.dumps(details, indent=2, ensure_ascii=False))
+        # ładne wyświetlenie szczegółów deploymentu i logów
+        print_deployment_details(details)
     else:
+        # lista deploymentów dla repo
         deploys = cli_instance.get_image_test_pipeline(group=arg)
         if not deploys:
             click.echo("No deploys found for repo")
@@ -450,16 +535,13 @@ def get_imagetestpipeline_cmd(ctx, arg, raw):
                 d.get("status") or "",
                 d.get("timestamp") or d.get("deployed_at") or d.get("created_at") or ""
             ])
-        # sort descending by ID
         rows.sort(key=lambda x: x[0], reverse=True)
         click.echo(tabulate(rows, headers=["ID", "Repo", "Tag", "Status", "Timestamp"], tablefmt="presto"))
 
-
-get.add_command(get_imagetestpipeline_cmd)
+# Aliasy
 get.add_command(get_imagetestpipeline_cmd, name="itp")
 get.add_command(get_imagetestpipeline_cmd, name="imagetest")
 get.add_command(get_imagetestpipeline_cmd, name="testpipeline")
-
 
 # ---------------- get deployment (primary) ----------------
 @get.command("deployment")
@@ -493,6 +575,29 @@ def get_deployment_cmd(ctx, arg):
 
 get.add_command(get_deployment_cmd, name="deploy")
 get.add_command(get_deployment_cmd, name="deployments")
+
+
+# ---------------- get repositories (new) ----------------
+@get.command("repo")
+@click.pass_context
+def get_repo_cmd(ctx):
+    """List repositories (admin sees all; regular user only their project)"""
+    cli_instance: DockerFlowCLI = ctx.obj
+    repos = cli_instance.get_repositories()
+    if not repos:
+        click.echo("No repositories found")
+        return
+    rows = [[r.get("id"), r.get("name"), r.get("project_id")] for r in repos]
+    rows.sort(key=lambda x: x[0] or 0, reverse=True)
+    click.echo(tabulate(rows, headers=["ID", "Name", "Project ID"], tablefmt="presto"))
+
+# add aliases
+get.add_command(get_repo_cmd, name="repos")
+get.add_command(get_repo_cmd, name="repositories")
+
+
+# ---------------- get imagetestpipeline ----------------
+# (already added above)
 
 
 # ---------------- Accept group ----------------
@@ -578,13 +683,15 @@ def adm_list_users_cmd(ctx):
 @adm.command("create-user")
 @click.option("--username", prompt=True)
 @click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True)
-@click.option("--project-id", type=int, default=None)
+@click.option("--project", default=None)
+@click.option("--email", prompt=True)
 @click.option("--is-admin", is_flag=True, default=False)
 @click.pass_context
-def adm_create_user_cmd(ctx, username, password, project_id, is_admin):
-    if project_id is None:
-        project_id = click.prompt("Project ID", type=int)
-    ctx.obj.adm_create_user(username, password, project_id, is_admin)
+def adm_create_user_cmd(ctx, username, password, project, email, is_admin):
+    if project is None:
+        # FIX: assign the prompt result back to `project`
+        project = click.prompt("Project")
+    ctx.obj.adm_create_user(username, password, project, email, is_admin)
 
 
 @adm.command("passwd")
@@ -595,10 +702,67 @@ def adm_passwd_cmd(ctx, user_id, password):
     ctx.obj.adm_change_password(user_id, password)
 
 
+@adm.command("create-project")
+@click.option("--name", prompt=True, help="Name of the project to create")
+@click.pass_context
+def adm_create_project_cmd(ctx, name):
+    """Create a new project"""
+    ctx.obj.adm_create_project(name)
+
+@adm.command("create-project")
+@click.option("--name", prompt=True, help="Name of the project to create")
+@click.pass_context
+def adm_create_project_cmd(ctx, name):
+    """Create a new project (admin only)"""
+    ctx.obj.adm_create_project(name)
+
+
+@adm.command("list-projects")
+@click.pass_context
+def adm_list_projects_cmd(ctx):
+    """List all projects (admin only)"""
+    ctx.obj.adm_list_projects()
+
+
+# ---------------- create group (new) ----------------
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def create(ctx):
+    """Create resources (e.g. repo)"""
+    if ctx.invoked_subcommand is None:
+        click.echo("   Use: kfc create <resource>")
+        click.echo("                                    ")
+        click.echo("   resources:")
+        click.echo("       - repo/repository - create repository")
+        return
+
+@create.command("repo")
+@click.option("--name", prompt=True, help="Repository name")
+@click.option("--project", "-p", default=None, help="Project name or ID")
+@click.option("--private/--public", default=True, help="Set repository visibility (default: private)")
+@click.option("--use-template/--no-template", default=True, help="Create from server template 'template' owned by 'gitea_admin' (default: true)")
+@click.pass_context
+def create_repo_cmd(ctx, name, project, private, use_template):
+    """
+    Create repository. If --project is numeric it's treated as project_id, otherwise as project_name.
+    """
+    cli_instance: DockerFlowCLI = ctx.obj
+    # if project not provided, prompt for it (match CLI conventions)
+    if project is None:
+        project = click.prompt("Project (name or id)")
+    success = cli_instance.create_repository(name=name, project=project, private=private, use_template=use_template)
+    if not success:
+        ctx.exit(1)
+
+# add aliases
+create.add_command(create_repo_cmd, name="repos")
+create.add_command(create_repo_cmd, name="repository")
+
+
 # ---------------- Helper printers ----------------
 def print_image_details(image: dict):
     rows = []
-    simple_fields = ["id", "repo_name", "image_name", "image_tag", "build_status", "deploy_status", "created_at", "project_id", "project","pipeline_image_test_id"]
+    simple_fields = ["id", "repo_name", "image_name", "image_tag", "build_status", "deploy_status", "created_at", "project","pipeline_image_test_id"]
     for f in simple_fields:
         rows.append([f, image.get(f, "N/A")])
 
@@ -617,31 +781,55 @@ def print_image_details(image: dict):
     click.echo(tabulate(rows, headers=["Property", "Value"], tablefmt="presto"))
 
 
-def print_deployment_details(deploy: dict):
-    nodes_field = deploy.get("node") if deploy.get("node") is not None else deploy.get("nodes", "")
-    if isinstance(nodes_field, list):
-        nodes_val = ", ".join(nodes_field)
-    else:
-        nodes_val = str(nodes_field) if nodes_field is not None else ""
+def print_deployment_details(d: dict):
+    """Wyświetla szczegóły deploymentu oraz logi z modelu ImageDeploy"""
+    if isinstance(d, list):
+        for item in d:
+            print_deployment_details(item)
+            click.echo("")
+        return
 
+    # 1. Podstawowe dane w tabeli (styl presto)
     rows = [
-        ["id", deploy.get("id")],
-        ["project", deploy.get("project")],
-        ["repo_name", deploy.get("repo_name") or deploy.get("repo")],
-        ["image_tag", deploy.get("image_tag") or deploy.get("tag")],
-        ["status", deploy.get("status")],
-        ["timestamp", deploy.get("timestamp") or deploy.get("deployed_at") or deploy.get("created_at")],
-        ["nodes", nodes_val],
-        ["commit_id", deploy.get("commit_id")],
-        ["commit_message", deploy.get("commit_message")],
-        ["commit_author", deploy.get("commit_author")],
+        ["id", d.get("id")],
+        ["repo_name", d.get("repo_name") or d.get("repo")],
+        ["image_tag", d.get("image_tag") or d.get("tag")],
+        ["status", d.get("status")],
+        ["project", d.get("project")],
+        ["timestamp", d.get("timestamp") or d.get("deployed_at")],
+        ["commit_author", d.get("commit_author")],
+        ["commit_id", d.get("commit_id")]
     ]
+    click.echo(tabulate(rows, tablefmt="presto"))
 
-    rows = [[k, v] for k, v in rows if v not in (None, "", [], {})]
+    # 2. Wyświetlanie logów zgodnie z modelem SQLAlchemy
 
-    click.echo(tabulate(rows, headers=["Property", "Value"], tablefmt="presto"))
+    # --- failed_task_info ---
+    failed_info = d.get("failed_task_info")
+    if failed_info:
+        click.echo("\n--- Failed Task Info ---")
+        click.echo(failed_info)
 
+    # --- last_playbook_lines ---
+    playbook_logs = d.get("last_playbook_lines")
+    if playbook_logs:
+        click.echo("\n--- Last Playbook Lines ---")
+        if isinstance(playbook_logs, list):
+            for s in playbook_logs:
+                click.echo(json.dumps(s, ensure_ascii=False, indent=2))
+        else:
+            click.echo(playbook_logs)
 
+    # --- pod_log_lines ---
+    pod_logs = d.get("pod_log_lines")
+    if pod_logs:
+        click.echo("\n--- Pod Log Lines ---")
+        if isinstance(pod_logs, list):
+            for s in pod_logs:
+                click.echo(json.dumps(s, ensure_ascii=False, indent=2))
+        else:
+            click.echo(pod_logs)
 # ---------------- Main ----------------
 if __name__ == "__main__":
     cli()
+
