@@ -1,0 +1,13 @@
+#!/bin/bash
+# Wrapper for Kubeflow CLI
+
+VENV_PATH="/usr/local/bin/kube-config/venv"
+CLI_PATH="/usr/local/bin/kube/cli.py"
+ENV_FILE="/usr/local/bin/kube-config/worker.env"
+
+
+# Activate virtualenv
+source "$VENV_PATH/bin/activate"
+
+# Run CLI
+python3 "$CLI_PATH" "$@"
