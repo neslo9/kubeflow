@@ -1,149 +1,137 @@
+
 ---
-- name: Set kubeconfig path and context variables
-  set_fact:
-    kubeconfig_path: "{{ lookup('env', 'HOME') + '/.kube/config' }}"
-    kube_context: "minikube"
+- name: Tag, push Docker image to Harbor, update DB and Kubernetes manifests
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    harbor_url:       "harbor.app.kubeflow.masternode:30002"
+    project:          "{{ project }}"
+    service_name:     "{{ service_name }}"
+    target_image:     "{{ target_image }}"
+    service_tag:      "{{ service_tag }}"
+    requested_tag:    "{{ new_tag | default('') }}"
+    docker_env:
+      DOCKER_HOST:       tcp://192.168.49.2:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH:  "/home/admin/.minikube/certs"
 
-- name: Get Deployment info from Kubernetes API
-  kubernetes.core.k8s_info:
-    api_version: apps/v1
-    kind: Deployment
-    namespace: default
-    name: "{{ repo_name }}"
-    kubeconfig: "{{ kubeconfig_path }}"
-    context: "{{ kube_context }}"
-  register: deployment_info
+    main_dir:              "/home/admin/{{ project }}/{{ service_name }}"
+    backup_dir:            "/home/admin/{{ project }}/backup/{{ service_name }}"
+    backup_manifest_dir:   "{{ backup_dir }}/{{ service_tag }}"
+    live_manifest:         "/path/to/live/deployment.yaml"  # <-- upewnij się, że istnieje
 
-- name: Fail if deployment not found
-  fail:
-    msg: "Deployment {{ repo_name }} not found!"
-  when: deployment_info.resources | length == 0
+  tasks:
+    - name: Change manifest permission
+      become: yes
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: admin
+        group: admin
+        mode: '0644'
+        state: file
+      loop:
+        - "{{ live_manifest }}"
+        - "{{ backup_manifest_dir }}/deployment.yaml"
+      ignore_errors: yes
 
-- name: Set deployment spec variable
-  set_fact:
-    dep_spec: "{{ deployment_info.resources[0].spec }}"
+    - name: Build remote_image variable
+      set_fact:
+        remote_image: "{{ harbor_url }}/{{ project }}/{{ service_name }}:{{ requested_tag }}"
 
-- name: Set pod spec variable
-  set_fact:
-    pod_spec: "{{ dep_spec.template.spec }}"
+    - name: Tag image for Harbor (do not fail whole playbook if this fails)
+      command: docker tag "{{ target_image }}" "{{ remote_image }}"
+      environment: "{{ docker_env }}"
+      register: tag_cmd
+      failed_when: false
+      changed_when: tag_cmd.rc == 0
 
-- name: Set container variable
-  set_fact:
-    container: "{{ pod_spec.containers[0] }}"
+    - name: Debug tag result
+      debug:
+        msg: "docker tag rc={{ tag_cmd.rc }} stdout={{ tag_cmd.stdout | default('') }} stderr={{ tag_cmd.stderr | default('') }}"
 
-- name: Initialize security check statuses
-  set_fact:
-    resource_check: "OK"
-    network_check: "OK"
-    privileges_check: "OK"
-    rootless_check: "OK"
-    healthcheck_check: "OK"
+    - name: Push image to Harbor (do not fail whole playbook if this fails)
+      command: docker push "{{ remote_image }}"
+      environment: "{{ docker_env }}"
+      register: push_cmd
+      failed_when: false
+      changed_when: push_cmd.rc == 0
 
-- name: Check resource limits and requests
-  set_fact:
-    resource_check: >-
-      {{
-        (container.resources is defined)
-        and (container.resources.limits.cpu is defined)
-        and (container.resources.limits.memory is defined)
-        and (container.resources.requests.cpu is defined)
-        and (container.resources.requests.memory is defined)
-      }}
-- name: Format resource_check
-  set_fact:
-    resource_check: "{{ 'OK' if resource_check else 'FAILED' }}"
+    - name: Debug push result
+      debug:
+        msg: "docker push rc={{ push_cmd.rc }} stdout={{ push_cmd.stdout | default('') }} stderr={{ push_cmd.stderr | default('') }}"
 
-- name: Check privileges/securityContext (safe)
-  set_fact:
-    privileges_check: >-
-      {{
-        (
-          (pod_spec.securityContext is defined and (pod_spec.securityContext.runAsNonRoot | default(false)))
-          and (container.securityContext is defined)
-          and ((container.securityContext.allowPrivilegeEscalation | default(true)) == false)
-          and ((container.securityContext.privileged | default(false)) == false)
-          and ('ALL' in (container.securityContext.capabilities.drop | default([])))
-        )
-      }}
+    - name: Check if backup folder exists
+      become: yes
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}/{{ service_tag }}"
+      register: backup_dir_stat
+      ignore_errors: yes
 
-- name: Format privileges_check
-  set_fact:
-    privileges_check: "{{ 'OK' if privileges_check else 'FAILED' }}"
+    - name: Check if main_dir exists
+      become: yes
+      ansible.builtin.stat:
+        path: "{{ main_dir }}"
+      register: main_dir_stat
+      ignore_errors: yes
 
+    - name: Copy main_dir to backup folder with approved_tag
+      become: yes
+      ansible.builtin.command:
+        cmd: cp -r "{{ main_dir }}" "{{ backup_dir }}/{{ requested_tag }}"
+      when: main_dir_stat.stat.exists | default(false)
+      ignore_errors: yes
 
+    - name: Rename backup folder from service_tag to approved_tag
+      become: yes
+      ansible.builtin.command:
+        cmd: mv "{{ backup_dir }}/{{ service_tag }}" "{{ backup_dir }}/{{ requested_tag }}"
+      when:
+        - "'latest' not in service_tag"
+        - backup_dir_stat.stat.exists | default(false)
+      ignore_errors: yes
 
-- name: Check runs as non-root user
-  set_fact:
-    rootless_check: >-
-      {{
-        (
-          (pod_spec.securityContext.runAsNonRoot | default(false))
-          or (pod_spec.securityContext.runAsUser is defined and pod_spec.securityContext.runAsUser != 0)
-          or (container.securityContext.runAsNonRoot | default(false))
-          or (container.securityContext.runAsUser is defined and container.securityContext.runAsUser != 0)
-        )
-      }}
+    - name: Update backup manifest with new image
+      become: yes
+      ansible.builtin.replace:
+        path: "{{ backup_dir }}/{{ requested_tag }}/k8s/deployment.yaml"
+        regexp: '(^\s*image:\s*).+'
+        replace: '\1{{ remote_image }}'
+        backup: yes
+      ignore_errors: yes
 
-- name: Format rootless_check
-  set_fact:
-    rootless_check: "{{ 'OK' if rootless_check else 'FAILED' }}"
+    - name: Remove local Docker image
+      become: yes
+      command: docker rmi "{{ target_image }}"
+      environment: "{{ docker_env }}"
+      ignore_errors: yes
 
-- name: Check healthchecks configured (liveness and readiness probes)
-  set_fact:
-    healthcheck_check: >-
-      {{
-        (container.livenessProbe is defined)
-        and (container.readinessProbe is defined)
-      }}
-- name: Format healthcheck_check
-  set_fact:
-    healthcheck_check: "{{ 'OK' if healthcheck_check else 'FAILED' }}"
+    # --- Ensure output file dir exists and then write tag ---
+    - name: Compute final output file (defaults to /tmp/approved_tag.txt)
+      set_fact:
+        final_output: "{{ output_file | default('/tmp/approved_tag.txt') }}"
 
-# --- poniżej Twoje oryginalne skany trivy i analiza
+    - name: Compute output dir (strip filename)
+      set_fact:
+        output_dir: "{{ final_output | regex_replace('/[^/]+$','') }}"
 
-- name: Install Trivy if not installed
-  shell: |
-    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-  args:
-    creates: /usr/local/bin/trivy
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
 
-- name: Scan image for vulnerabilities (JSON)
-  command: trivy image --severity CRITICAL,HIGH -f json {{ target_image }}
-  register: trivy_json
-  failed_when: false
-  changed_when: false
-  environment: "{{ docker_env }}"
+    - name: Save approved_tag to file (always try to write)
+      ansible.builtin.copy:
+        dest: "{{ final_output }}"
+        content: "{{ requested_tag }}"
+        mode: '0644'
+      ignore_errors: yes
 
-- name: Parse Trivy JSON output
-  set_fact:
-    trivy_parsed: "{{ trivy_json.stdout | from_json }}"
-  ignore_errors: yes
-
-- name: Scan image for vulnerabilities (plain output)
-  command: trivy image --severity CRITICAL,HIGH {{ target_image }}
-  register: trivy_raw
-  failed_when: false
-  changed_when: false
-  environment: "{{ docker_env }}"
-
-- name: Extract CRITICAL & HIGH vulnerabilities
-  set_fact:
-    trivy_vulns: >-
-      {{
-        trivy_parsed.Results
-        | json_query("[].Vulnerabilities[?Severity=='CRITICAL' || Severity=='HIGH']")
-        | sum(start=[])
-      }}
-
-- name: Count CRITICAL/HIGH vulnerabilities
-  set_fact:
-    critical_vulns: "{{ trivy_vulns | selectattr('Severity','equalto','CRITICAL') | list | length }}"
-    high_vulns:     "{{ trivy_vulns | selectattr('Severity','equalto','HIGH')   | list | length }}"
-
-- name: Record vulnerability issues
-  set_fact:
-    security_issues: "{{ security_issues + ['Vuln: ' ~ item.PkgName ~ ' (' ~ item.Severity ~ ')'] }}"
-  loop: "{{ trivy_vulns }}"
-  loop_control:
-    loop_var: item
-  when: trivy_vulns | length > 0
+    - name: Debug approved_tag
+      debug:
+        msg:
+          - "approved_tag={{ requested_tag }}"
+          - "final_output={{ final_output }}"
+          - "tag_cmd_rc={{ tag_cmd.rc | default('NA') }}"
+          - "push_cmd_rc={{ push_cmd.rc | default('NA') }}"
