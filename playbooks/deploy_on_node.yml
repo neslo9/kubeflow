@@ -1,3 +1,4 @@
+
 ---
 - name: Deploy Kubernetes manifests on Minikube node
   hosts: "{{ target_hosts | default(project) }}"
@@ -49,7 +50,7 @@
 
     - name: Apply Kubernetes manifests using kubectl
       become_user: ansible
-      shell: kubectl apply -f /home/ansible/k8s-manifests/
+      shell: kubectl apply -f /home/ansible/k8s-manifests/ --force
       environment:
         KUBECONFIG: /home/ansible/.kube/config
       register: kubectl_apply_output
@@ -57,4 +58,3 @@
     - name: Show kubectl output
       debug:
         var: kubectl_apply_output.stdout_lines
-
